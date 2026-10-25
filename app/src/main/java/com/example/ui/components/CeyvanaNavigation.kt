@@ -7,6 +7,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Assignment
 import androidx.compose.material.icons.automirrored.filled.Logout
+import androidx.compose.material.icons.filled.Assessment
 import androidx.compose.material.icons.filled.CalendarMonth
 import androidx.compose.material.icons.filled.Category
 import androidx.compose.material.icons.filled.Dashboard
@@ -46,6 +47,7 @@ val navigationItems = listOf(
     NavigationTabItem(MainNavigationSection.DASHBOARD, Icons.Default.Dashboard, "nav_dashboard"),
     NavigationTabItem(MainNavigationSection.PRODUCTS, Icons.Default.Category, "nav_products"),
     NavigationTabItem(MainNavigationSection.DAILY_SALES, Icons.Default.ReceiptLong, "nav_daily_sales"),
+    NavigationTabItem(MainNavigationSection.REPORTS, Icons.Default.Assessment, "nav_reports"),
     NavigationTabItem(MainNavigationSection.CALENDAR, Icons.Default.CalendarMonth, "nav_calendar"),
     NavigationTabItem(MainNavigationSection.ORDERS_NOTES, Icons.AutoMirrored.Filled.Assignment, "nav_orders_notes")
 )

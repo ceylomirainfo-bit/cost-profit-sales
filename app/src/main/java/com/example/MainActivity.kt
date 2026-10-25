@@ -34,6 +34,7 @@ import com.example.ui.screens.DashboardScreen
 import com.example.ui.screens.LockScreen
 import com.example.ui.screens.OrdersNotesScreen
 import com.example.ui.screens.ProductsScreen
+import com.example.ui.screens.ReportsScreen
 import com.example.ui.theme.MyApplicationTheme
 import com.example.ui.theme.WarmIvoryBackground
 import com.example.ui.viewmodel.CeyvanaViewModel
@@ -187,6 +188,9 @@ private fun AppScreenContent(
                 viewModel = viewModel,
                 onOpenDatePicker = onOpenDatePicker
             )
+        }
+        MainNavigationSection.REPORTS -> {
+            ReportsScreen(viewModel = viewModel)
         }
         MainNavigationSection.CALENDAR -> {
             CalendarScreen(

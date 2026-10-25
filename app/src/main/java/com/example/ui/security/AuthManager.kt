@@ -2,9 +2,10 @@ package com.example.ui.security
 
 import android.content.Context
 import android.content.SharedPreferences
+import com.google.firebase.Firebase
+import com.google.firebase.auth.auth
 import java.security.MessageDigest
 import java.security.SecureRandom
-import java.util.Locale
 
 sealed class AuthResult {
     data class Success(val email: String, val username: String) : AuthResult()
@@ -12,75 +13,129 @@ sealed class AuthResult {
     data class Lockout(val secondsRemaining: Int) : AuthResult()
 }
 
+sealed class PinResult {
+    object Success : PinResult()
+    data class Error(val message: String, val attemptsRemaining: Int) : PinResult()
+    data class Lockout(val secondsRemaining: Int) : PinResult()
+    object NotConfigured : PinResult()
+}
+
 class AuthManager(context: Context) {
     private val prefs: SharedPreferences = context.getSharedPreferences("ceyvana_auth_prefs", Context.MODE_PRIVATE)
 
     companion object {
-        const val DEFAULT_OWNER_EMAIL = "ceylomirainfo@gmail.com"
-        const val DEFAULT_OWNER_USERNAME = "admin"
-        const val DEFAULT_OWNER_PASSWORD = "Ceyvana@2026"
-        const val DEFAULT_PIN = "1234"
-
         private const val KEY_IS_AUTHENTICATED = "is_authenticated"
         private const val KEY_USER_EMAIL = "user_email"
         private const val KEY_USERNAME = "username"
         private const val KEY_PASSWORD_SALT = "password_salt"
         private const val KEY_PASSWORD_HASH = "password_hash"
-        private const val KEY_OWNER_PIN = "owner_pin"
+
+        // Cryptographically secure salted PIN storage (NEVER store plaintext)
+        private const val KEY_PIN_SALT = "pin_salt"
+        private const val KEY_PIN_HASH = "pin_hash"
+        private const val KEY_LEGACY_PLAIN_PIN = "owner_pin"
+
         private const val KEY_FAILED_ATTEMPTS = "failed_attempts"
         private const val KEY_LOCKOUT_UNTIL_TIMESTAMP = "lockout_until"
 
-        private const val MAX_FAILED_ATTEMPTS = 5
-        private const val LOCKOUT_DURATION_MS = 15_000L // 15 seconds cooldown
+        private const val KEY_FAILED_PIN_ATTEMPTS = "failed_pin_attempts"
+        private const val KEY_PIN_LOCKOUT_UNTIL = "pin_lockout_until"
+
+        const val MAX_FAILED_ATTEMPTS = 5
+        const val LOCKOUT_DURATION_MS = 30_000L // 30 seconds progressive lockout
     }
 
     init {
-        // Initialize default owner credentials with secure hash if not yet set
-        if (!prefs.contains(KEY_PASSWORD_HASH)) {
-            val salt = generateSalt()
-            val hash = hashPassword(DEFAULT_OWNER_PASSWORD, salt)
-            prefs.edit()
-                .putString(KEY_USER_EMAIL, DEFAULT_OWNER_EMAIL)
-                .putString(KEY_USERNAME, DEFAULT_OWNER_USERNAME)
-                .putString(KEY_PASSWORD_SALT, salt)
-                .putString(KEY_PASSWORD_HASH, hash)
-                .putString(KEY_OWNER_PIN, DEFAULT_PIN)
-                .apply()
+        // Migration: Purge any legacy plaintext PIN keys from SharedPreferences
+        if (prefs.contains(KEY_LEGACY_PLAIN_PIN)) {
+            prefs.edit().remove(KEY_LEGACY_PLAIN_PIN).apply()
         }
     }
 
     fun isUserLoggedIn(): Boolean {
-        return prefs.getBoolean(KEY_IS_AUTHENTICATED, false)
+        val hasFirebaseSession = try {
+            Firebase.auth.currentUser != null
+        } catch (_: Exception) {
+            false
+        }
+        return prefs.getBoolean(KEY_IS_AUTHENTICATED, false) || hasFirebaseSession
     }
 
     fun getCurrentEmail(): String {
-        return prefs.getString(KEY_USER_EMAIL, DEFAULT_OWNER_EMAIL) ?: DEFAULT_OWNER_EMAIL
+        if (!isUserLoggedIn()) return ""
+        val firebaseEmail = try {
+            Firebase.auth.currentUser?.email
+        } catch (_: Exception) {
+            null
+        }
+        return firebaseEmail ?: prefs.getString(KEY_USER_EMAIL, "") ?: ""
     }
 
     fun getCurrentUsername(): String {
-        return prefs.getString(KEY_USERNAME, DEFAULT_OWNER_USERNAME) ?: DEFAULT_OWNER_USERNAME
+        if (!isUserLoggedIn()) return ""
+        val firebaseName = try {
+            Firebase.auth.currentUser?.displayName
+        } catch (_: Exception) {
+            null
+        }
+        return firebaseName ?: prefs.getString(KEY_USERNAME, "") ?: ""
     }
 
-    fun getCurrentPin(): String {
-        return prefs.getString(KEY_OWNER_PIN, DEFAULT_PIN) ?: DEFAULT_PIN
+    fun onGoogleAuthSuccess(email: String, displayName: String?) {
+        prefs.edit()
+            .putBoolean(KEY_IS_AUTHENTICATED, true)
+            .putString(KEY_USER_EMAIL, email)
+            .putString(KEY_USERNAME, displayName ?: email.substringBefore("@"))
+            .putInt(KEY_FAILED_ATTEMPTS, 0)
+            .putLong(KEY_LOCKOUT_UNTIL_TIMESTAMP, 0L)
+            .putInt(KEY_FAILED_PIN_ATTEMPTS, 0)
+            .putLong(KEY_PIN_LOCKOUT_UNTIL, 0L)
+            .apply()
+    }
+
+    fun hasConfiguredPassword(): Boolean {
+        return prefs.contains(KEY_PASSWORD_HASH) && prefs.contains(KEY_PASSWORD_SALT)
+    }
+
+    fun setupAccountPassword(email: String, username: String, password: String): Pair<Boolean, String> {
+        val trimmedEmail = email.trim()
+        val trimmedUser = username.trim()
+        val trimmedPass = password.trim()
+
+        if (trimmedEmail.isEmpty() || !trimmedEmail.contains("@")) {
+            return Pair(false, "Please provide a valid email address.")
+        }
+        if (trimmedUser.isEmpty()) {
+            return Pair(false, "Username cannot be blank.")
+        }
+        if (trimmedPass.length < 8) {
+            return Pair(false, "Password must be at least 8 characters.")
+        }
+
+        val salt = generateSalt()
+        val hash = hashCredential(trimmedPass, salt)
+        prefs.edit()
+            .putString(KEY_USER_EMAIL, trimmedEmail)
+            .putString(KEY_USERNAME, trimmedUser)
+            .putString(KEY_PASSWORD_SALT, salt)
+            .putString(KEY_PASSWORD_HASH, hash)
+            .apply()
+
+        return Pair(true, "Account security credentials configured successfully.")
     }
 
     fun authenticate(identifier: String, passwordAttempt: String): AuthResult {
         val trimmedId = identifier.trim()
         val trimmedPass = passwordAttempt.trim()
 
-        // 1. Validation of required inputs
         if (trimmedId.isEmpty()) {
             return AuthResult.Error("Please enter your business email or username.")
         }
         if (trimmedPass.isEmpty()) {
             return AuthResult.Error("Please enter your password.")
         }
-        if (trimmedPass.length < 6) {
-            return AuthResult.Error("Password must be at least 6 characters.")
-        }
 
-        // 2. Lockout protection
+        // Lockout protection against brute-force attacks
         val now = System.currentTimeMillis()
         val lockoutUntil = prefs.getLong(KEY_LOCKOUT_UNTIL_TIMESTAMP, 0L)
         if (now < lockoutUntil) {
@@ -88,22 +143,22 @@ class AuthManager(context: Context) {
             return AuthResult.Lockout(secondsRemaining)
         }
 
-        // 3. Credential verification against stored cryptographic salt & hash
-        val storedEmail = getCurrentEmail()
-        val storedUsername = getCurrentUsername()
+        if (!hasConfiguredPassword()) {
+            return AuthResult.Error("No local password account configured. Please sign in with Google.")
+        }
+
+        val storedEmail = prefs.getString(KEY_USER_EMAIL, "") ?: ""
+        val storedUsername = prefs.getString(KEY_USERNAME, "") ?: ""
         val storedSalt = prefs.getString(KEY_PASSWORD_SALT, "") ?: ""
         val storedHash = prefs.getString(KEY_PASSWORD_HASH, "") ?: ""
 
         val identifierMatches = trimmedId.equals(storedEmail, ignoreCase = true) ||
-                trimmedId.equals(storedUsername, ignoreCase = true) ||
-                trimmedId.equals("owner", ignoreCase = true) ||
-                trimmedId.equals("admin", ignoreCase = true)
+                trimmedId.equals(storedUsername, ignoreCase = true)
 
-        val computedHash = hashPassword(trimmedPass, storedSalt)
+        val computedHash = hashCredential(trimmedPass, storedSalt)
         val passwordMatches = computedHash == storedHash
 
         if (identifierMatches && passwordMatches) {
-            // Reset attempts and establish authenticated session
             prefs.edit()
                 .putBoolean(KEY_IS_AUTHENTICATED, true)
                 .putInt(KEY_FAILED_ATTEMPTS, 0)
@@ -115,29 +170,107 @@ class AuthManager(context: Context) {
             val editor = prefs.edit().putInt(KEY_FAILED_ATTEMPTS, failedCount)
             if (failedCount >= MAX_FAILED_ATTEMPTS) {
                 val newLockoutUntil = now + LOCKOUT_DURATION_MS
-                editor.putLong(KEY_LOCKOUT_UNTIL_TIMESTAMP, newLockoutUntil)
-                editor.apply()
-                return AuthResult.Lockout(15)
+                editor.putLong(KEY_LOCKOUT_UNTIL_TIMESTAMP, newLockoutUntil).apply()
+                return AuthResult.Lockout((LOCKOUT_DURATION_MS / 1000).toInt())
             }
             editor.apply()
             val remaining = MAX_FAILED_ATTEMPTS - failedCount
-            return AuthResult.Error("Invalid credentials. Please verify your email/username and password ($remaining attempts remaining).")
+            return AuthResult.Error("Invalid credentials. $remaining attempt${if (remaining == 1) "" else "s"} remaining.")
         }
     }
 
-    fun unlockWithPin(pinAttempt: String): Boolean {
-        val storedPin = getCurrentPin()
-        return if (pinAttempt == storedPin) {
-            prefs.edit().putBoolean(KEY_IS_AUTHENTICATED, true).apply()
-            true
+    // --- SECURE 4-DIGIT APP-LOCK PIN ---
+
+    fun hasConfiguredPin(): Boolean {
+        return prefs.contains(KEY_PIN_HASH) && prefs.contains(KEY_PIN_SALT)
+    }
+
+    fun setupPin(newPin: String): Pair<Boolean, String> {
+        val trimmed = newPin.trim()
+        if (trimmed.length != 4 || !trimmed.all { it.isDigit() }) {
+            return Pair(false, "PIN must consist of exactly 4 digits.")
+        }
+
+        val salt = generateSalt()
+        val hash = hashCredential(trimmed, salt)
+        prefs.edit()
+            .putString(KEY_PIN_SALT, salt)
+            .putString(KEY_PIN_HASH, hash)
+            .putInt(KEY_FAILED_PIN_ATTEMPTS, 0)
+            .putLong(KEY_PIN_LOCKOUT_UNTIL, 0L)
+            .apply()
+
+        return Pair(true, "Security PIN created successfully.")
+    }
+
+    fun unlockWithPin(pinAttempt: String): PinResult {
+        if (!hasConfiguredPin()) {
+            return PinResult.NotConfigured
+        }
+
+        val trimmed = pinAttempt.trim()
+        if (trimmed.length != 4 || !trimmed.all { it.isDigit() }) {
+            val failed = prefs.getInt(KEY_FAILED_PIN_ATTEMPTS, 0)
+            val remaining = (MAX_FAILED_ATTEMPTS - failed).coerceAtLeast(1)
+            return PinResult.Error("PIN must be exactly 4 digits.", remaining)
+        }
+
+        val now = System.currentTimeMillis()
+        val lockoutUntil = prefs.getLong(KEY_PIN_LOCKOUT_UNTIL, 0L)
+        if (now < lockoutUntil) {
+            val secondsRemaining = ((lockoutUntil - now) / 1000).toInt().coerceAtLeast(1)
+            return PinResult.Lockout(secondsRemaining)
+        }
+
+        val storedSalt = prefs.getString(KEY_PIN_SALT, "") ?: ""
+        val storedHash = prefs.getString(KEY_PIN_HASH, "") ?: ""
+
+        val computedHash = hashCredential(trimmed, storedSalt)
+        return if (computedHash == storedHash) {
+            prefs.edit()
+                .putBoolean(KEY_IS_AUTHENTICATED, true)
+                .putInt(KEY_FAILED_PIN_ATTEMPTS, 0)
+                .putLong(KEY_PIN_LOCKOUT_UNTIL, 0L)
+                .apply()
+            PinResult.Success
         } else {
-            false
+            val failedCount = prefs.getInt(KEY_FAILED_PIN_ATTEMPTS, 0) + 1
+            val editor = prefs.edit().putInt(KEY_FAILED_PIN_ATTEMPTS, failedCount)
+            if (failedCount >= MAX_FAILED_ATTEMPTS) {
+                val newLockoutUntil = now + LOCKOUT_DURATION_MS
+                editor.putLong(KEY_PIN_LOCKOUT_UNTIL, newLockoutUntil).apply()
+                PinResult.Lockout((LOCKOUT_DURATION_MS / 1000).toInt())
+            } else {
+                editor.apply()
+                val remaining = MAX_FAILED_ATTEMPTS - failedCount
+                PinResult.Error("Incorrect PIN. $remaining attempt${if (remaining == 1) "" else "s"} remaining.", remaining)
+            }
         }
     }
 
-    fun quickOwnerUnlock(): Boolean {
-        prefs.edit().putBoolean(KEY_IS_AUTHENTICATED, true).apply()
-        return true
+    fun changePin(currentPin: String, newPin: String): Pair<Boolean, String> {
+        if (!hasConfiguredPin()) {
+            return Pair(false, "No existing PIN configured.")
+        }
+        val storedSalt = prefs.getString(KEY_PIN_SALT, "") ?: ""
+        val storedHash = prefs.getString(KEY_PIN_HASH, "") ?: ""
+
+        if (hashCredential(currentPin.trim(), storedSalt) != storedHash) {
+            return Pair(false, "Current PIN is incorrect.")
+        }
+        if (newPin.trim().length != 4 || !newPin.trim().all { it.isDigit() }) {
+            return Pair(false, "New PIN must be exactly 4 digits.")
+        }
+
+        val newSalt = generateSalt()
+        val newHash = hashCredential(newPin.trim(), newSalt)
+        prefs.edit()
+            .putString(KEY_PIN_SALT, newSalt)
+            .putString(KEY_PIN_HASH, newHash)
+            .putInt(KEY_FAILED_PIN_ATTEMPTS, 0)
+            .apply()
+
+        return Pair(true, "Security PIN updated successfully.")
     }
 
     fun lock() {
@@ -147,41 +280,14 @@ class AuthManager(context: Context) {
     fun logout() {
         prefs.edit()
             .putBoolean(KEY_IS_AUTHENTICATED, false)
+            .putString(KEY_USER_EMAIL, "")
+            .putString(KEY_USERNAME, "")
             .putInt(KEY_FAILED_ATTEMPTS, 0)
+            .putInt(KEY_FAILED_PIN_ATTEMPTS, 0)
             .apply()
-    }
-
-    fun changePassword(oldPass: String, newPass: String): Pair<Boolean, String> {
-        val storedSalt = prefs.getString(KEY_PASSWORD_SALT, "") ?: ""
-        val storedHash = prefs.getString(KEY_PASSWORD_HASH, "") ?: ""
-
-        if (hashPassword(oldPass, storedSalt) != storedHash) {
-            return Pair(false, "Current password does not match.")
-        }
-        if (newPass.length < 6) {
-            return Pair(false, "New password must be at least 6 characters.")
-        }
-
-        val newSalt = generateSalt()
-        val newHash = hashPassword(newPass, newSalt)
-        prefs.edit()
-            .putString(KEY_PASSWORD_SALT, newSalt)
-            .putString(KEY_PASSWORD_HASH, newHash)
-            .apply()
-
-        return Pair(true, "Password updated successfully.")
-    }
-
-    fun changePin(oldPin: String, newPin: String): Pair<Boolean, String> {
-        val storedPin = getCurrentPin()
-        if (oldPin != storedPin) {
-            return Pair(false, "Current PIN does not match.")
-        }
-        if (newPin.length != 4 || !newPin.all { it.isDigit() }) {
-            return Pair(false, "PIN must be 4 digits.")
-        }
-        prefs.edit().putString(KEY_OWNER_PIN, newPin).apply()
-        return Pair(true, "PIN updated successfully.")
+        try {
+            Firebase.auth.signOut()
+        } catch (_: Exception) {}
     }
 
     private fun generateSalt(): String {
@@ -191,10 +297,10 @@ class AuthManager(context: Context) {
         return saltBytes.joinToString("") { "%02x".format(it) }
     }
 
-    private fun hashPassword(password: String, salt: String): String {
+    private fun hashCredential(secret: String, salt: String): String {
         val md = MessageDigest.getInstance("SHA-256")
-        val combined = "$salt:$password:CEYVANA_SPICES_2026".toByteArray(Charsets.UTF_8)
-        val digest = md.digest(combined)
+        val payload = "$salt:$secret:CEYVANA_AUTHENTICATION_SALT_2026".toByteArray(Charsets.UTF_8)
+        val digest = md.digest(payload)
         return digest.joinToString("") { "%02x".format(it) }
     }
 }

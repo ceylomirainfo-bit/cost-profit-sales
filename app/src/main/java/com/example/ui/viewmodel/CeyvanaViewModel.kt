@@ -11,10 +11,20 @@ import com.example.data.model.ProductWithVariants
 import com.example.data.model.SaleEntity
 import com.example.data.model.SaleLineItemEntity
 import com.example.data.model.SaleWithItems
+import com.example.data.model.BusinessReportData
+import com.example.data.model.ReportCalculator
+import com.example.data.model.ReportPeriodPreset
 import com.example.data.repository.CeyvanaRepository
 import com.example.ui.security.AuthManager
 import com.example.ui.security.AuthResult
+import com.example.ui.util.CsvReportGenerator
 import com.example.ui.util.DateUtils
+import com.example.ui.util.PdfReportGenerator
+import com.example.ui.util.ReportPrintHelper
+import com.example.ui.util.ReportSharingUtils
+import com.google.firebase.Firebase
+import com.google.firebase.auth.auth
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -27,6 +37,7 @@ enum class MainNavigationSection(val title: String) {
     DASHBOARD("Dashboard"),
     PRODUCTS("Products"),
     DAILY_SALES("Daily Sales"),
+    REPORTS("Reports"),
     CALENDAR("Calendar"),
     ORDERS_NOTES("Orders & Notes")
 }
@@ -72,15 +83,59 @@ data class DashboardSummary(
 
 class CeyvanaViewModel(application: Application) : AndroidViewModel(application) {
 
+    private val firestoreRepository: com.example.data.remote.CeyvanaFirestoreRepository =
+        com.example.data.remote.CeyvanaFirestoreRepository(application)
     private val repository: CeyvanaRepository
     val authManager: AuthManager = AuthManager(application)
 
+    // Track actual Sri Lankan today and update dynamically (including overnight changes)
+    private val _actualTodayDate = MutableStateFlow(DateUtils.getActualTodayIso())
+    val actualTodayDate: StateFlow<String> = _actualTodayDate.asStateFlow()
+
+    private val _isCloudSyncing = MutableStateFlow(false)
+    val isCloudSyncing: StateFlow<Boolean> = _isCloudSyncing.asStateFlow()
+
     init {
         val database = AppDatabase.getDatabase(application, viewModelScope)
-        repository = CeyvanaRepository(database)
+        repository = CeyvanaRepository(database, firestoreRepository)
         viewModelScope.launch {
             repository.ensureCatalogueInitialized()
+            if (com.google.firebase.Firebase.auth.currentUser != null) {
+                repository.syncAllToFirestore()
+            }
         }
+        // Periodic check to update actual Sri Lankan today automatically when calendar day changes
+        viewModelScope.launch {
+            while (true) {
+                delay(30_000) // check every 30 seconds
+                val currentSriLankaToday = DateUtils.getActualTodayIso()
+                if (currentSriLankaToday != _actualTodayDate.value) {
+                    val wasOnToday = (_selectedBusinessDate.value == _actualTodayDate.value)
+                    _actualTodayDate.value = currentSriLankaToday
+                    if (wasOnToday) {
+                        _selectedBusinessDate.value = currentSriLankaToday
+                    }
+                }
+            }
+        }
+    }
+
+    fun syncFullDatabase() {
+        viewModelScope.launch {
+            _isCloudSyncing.value = true
+            repository.syncAllToFirestore()
+            _isCloudSyncing.value = false
+            notifyUser("Cloud synchronization complete")
+        }
+    }
+
+    fun onGoogleSignInSuccess(email: String, displayName: String?) {
+        authManager.onGoogleAuthSuccess(email, displayName)
+        _currentUserEmail.value = email
+        _currentUsername.value = displayName ?: email.substringBefore("@")
+        _isAppLocked.value = false
+        notifyUser("Signed in as $email. Cloud sync enabled.")
+        syncFullDatabase()
     }
 
     // Active Navigation Section
@@ -91,8 +146,8 @@ class CeyvanaViewModel(application: Application) : AndroidViewModel(application)
         _currentSection.value = section
     }
 
-    // Selected Business Date (defaults to 24 October 2026 per brief)
-    private val _selectedBusinessDate = MutableStateFlow(DateUtils.INITIAL_BUSINESS_DATE)
+    // Selected Business Date: dynamically initialized to actual Sri Lanka today
+    private val _selectedBusinessDate = MutableStateFlow(DateUtils.getActualTodayIso())
     val selectedBusinessDate: StateFlow<String> = _selectedBusinessDate.asStateFlow()
 
     fun setSelectedDate(isoDate: String) {
@@ -133,24 +188,31 @@ class CeyvanaViewModel(application: Application) : AndroidViewModel(application)
 
     fun logout() {
         authManager.logout()
+        try {
+            com.google.firebase.Firebase.auth.signOut()
+        } catch (_: Exception) {}
+        _currentUserEmail.value = ""
+        _currentUsername.value = ""
         _isAppLocked.value = true
         _currentSection.value = MainNavigationSection.DASHBOARD
         notifyUser("Signed out of Ceyvana Spices")
     }
 
-    fun unlockApp(pin: String): Boolean {
-        val success = authManager.unlockWithPin(pin)
-        if (success) {
+    fun hasConfiguredPin(): Boolean = authManager.hasConfiguredPin()
+
+    fun setupPin(newPin: String): Pair<Boolean, String> {
+        val (ok, message) = authManager.setupPin(newPin)
+        notifyUser(message)
+        return Pair(ok, message)
+    }
+
+    fun unlockWithPin(pin: String): com.example.ui.security.PinResult {
+        val result = authManager.unlockWithPin(pin)
+        if (result is com.example.ui.security.PinResult.Success) {
             _isAppLocked.value = false
             notifyUser("Dashboard Unlocked")
         }
-        return success
-    }
-
-    fun quickUnlock() {
-        authManager.quickOwnerUnlock()
-        _isAppLocked.value = false
-        notifyUser("Unlocked with Owner Access")
+        return result
     }
 
     fun changeOwnerPin(oldPin: String, newPin: String): Boolean {
@@ -159,10 +221,10 @@ class CeyvanaViewModel(application: Application) : AndroidViewModel(application)
         return ok
     }
 
-    fun changeOwnerPassword(oldPass: String, newPass: String): Boolean {
-        val (ok, message) = authManager.changePassword(oldPass, newPass)
+    fun setupAccountPassword(email: String, username: String, pass: String): Pair<Boolean, String> {
+        val (ok, message) = authManager.setupAccountPassword(email, username, pass)
         notifyUser(message)
-        return ok
+        return Pair(ok, message)
     }
 
     // Toast/Snackbar notifications
@@ -534,6 +596,148 @@ class CeyvanaViewModel(application: Application) : AndroidViewModel(application)
             } catch (e: Exception) {
                 notifyUser("Failed to delete note: ${e.message}")
             }
+        }
+    }
+
+    // --- BUSINESS REPORTING MODULE ---
+    private val _reportPeriodPreset = MutableStateFlow(ReportPeriodPreset.THIS_MONTH)
+    val reportPeriodPreset: StateFlow<ReportPeriodPreset> = _reportPeriodPreset.asStateFlow()
+
+    private val initialMonthRange = DateUtils.getThisMonthRangeIso()
+    private val _reportStartDate = MutableStateFlow(initialMonthRange.first)
+    val reportStartDate: StateFlow<String> = _reportStartDate.asStateFlow()
+
+    private val _reportEndDate = MutableStateFlow(initialMonthRange.second)
+    val reportEndDate: StateFlow<String> = _reportEndDate.asStateFlow()
+
+    val businessReport: StateFlow<BusinessReportData> = combine(
+        allSales,
+        allOrderNotes,
+        _reportPeriodPreset,
+        _reportStartDate,
+        _reportEndDate
+    ) { sales, notes, preset, start, end ->
+        ReportCalculator.computeReport(
+            preset = preset,
+            startDateIso = start,
+            endDateIso = end,
+            salesWithItems = sales,
+            orderNotes = notes
+        )
+    }.stateIn(
+        viewModelScope,
+        SharingStarted.WhileSubscribed(5000),
+        ReportCalculator.computeReport(
+            ReportPeriodPreset.THIS_MONTH,
+            initialMonthRange.first,
+            initialMonthRange.second,
+            emptyList()
+        )
+    )
+
+    fun setReportPeriodPreset(preset: ReportPeriodPreset) {
+        _reportPeriodPreset.value = preset
+        when (preset) {
+            ReportPeriodPreset.TODAY -> {
+                val today = DateUtils.getActualTodayIso()
+                _reportStartDate.value = today
+                _reportEndDate.value = today
+            }
+            ReportPeriodPreset.YESTERDAY -> {
+                val yesterday = DateUtils.getYesterdayIso()
+                _reportStartDate.value = yesterday
+                _reportEndDate.value = yesterday
+            }
+            ReportPeriodPreset.THIS_WEEK -> {
+                val (start, end) = DateUtils.getThisWeekRangeIso()
+                _reportStartDate.value = start
+                _reportEndDate.value = end
+            }
+            ReportPeriodPreset.THIS_MONTH -> {
+                val (start, end) = DateUtils.getThisMonthRangeIso()
+                _reportStartDate.value = start
+                _reportEndDate.value = end
+            }
+            ReportPeriodPreset.PREVIOUS_MONTH -> {
+                val (start, end) = DateUtils.getPreviousMonthRangeIso()
+                _reportStartDate.value = start
+                _reportEndDate.value = end
+            }
+            ReportPeriodPreset.CUSTOM, ReportPeriodPreset.SINGLE_DATE -> {
+                // Preserves current custom bounds until explicitly updated
+            }
+        }
+    }
+
+    fun setCustomReportRange(startIso: String, endIso: String) {
+        if (!DateUtils.isRangeValid(startIso, endIso)) {
+            notifyUser("Start date cannot be after end date")
+            return
+        }
+        _reportPeriodPreset.value = ReportPeriodPreset.CUSTOM
+        _reportStartDate.value = startIso
+        _reportEndDate.value = endIso
+        notifyUser("Report range set: ${DateUtils.formatPeriodRangeDisplay(startIso, endIso)}")
+    }
+
+    fun setSingleDateReport(dateIso: String) {
+        _reportPeriodPreset.value = ReportPeriodPreset.SINGLE_DATE
+        _reportStartDate.value = dateIso
+        _reportEndDate.value = dateIso
+        notifyUser("Report period set to ${DateUtils.formatIsoToDisplay(dateIso)}")
+    }
+
+    fun resetReportFilters() {
+        setReportPeriodPreset(ReportPeriodPreset.THIS_MONTH)
+        notifyUser("Report period reset to This Month")
+    }
+
+    fun exportReportPdf(context: android.content.Context) {
+        try {
+            val report = businessReport.value
+            val file = PdfReportGenerator.generatePdfReport(context, report)
+            ReportSharingUtils.sharePdfFile(context, report)
+            notifyUser("Exported PDF: ${file.name}")
+        } catch (e: Exception) {
+            notifyUser("Failed to export PDF: ${e.message}")
+        }
+    }
+
+    fun exportReportCsv(context: android.content.Context) {
+        try {
+            val report = businessReport.value
+            val file = CsvReportGenerator.generateCsvReport(context, report)
+            ReportSharingUtils.shareCsvFile(context, report)
+            notifyUser("Exported CSV: ${file.name}")
+        } catch (e: Exception) {
+            notifyUser("Failed to export CSV: ${e.message}")
+        }
+    }
+
+    fun printReport(context: android.content.Context) {
+        val report = businessReport.value
+        ReportPrintHelper.printReport(context, report) { _, msg ->
+            notifyUser(msg)
+        }
+    }
+
+    fun shareReportViaEmail(context: android.content.Context) {
+        try {
+            val report = businessReport.value
+            ReportSharingUtils.shareViaEmail(context, report)
+            notifyUser("Opening email share dialog")
+        } catch (e: Exception) {
+            notifyUser("Failed to share via email: ${e.message}")
+        }
+    }
+
+    fun shareReportViaWhatsApp(context: android.content.Context) {
+        try {
+            val report = businessReport.value
+            ReportSharingUtils.shareViaWhatsApp(context, report)
+            notifyUser("Opening WhatsApp share")
+        } catch (e: Exception) {
+            notifyUser("Failed to share via WhatsApp: ${e.message}")
         }
     }
 }

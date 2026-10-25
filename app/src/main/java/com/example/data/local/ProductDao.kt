@@ -58,4 +58,10 @@ interface ProductDao {
 
     @Query("SELECT COUNT(*) FROM sale_line_items WHERE productId = :productId")
     suspend fun countHistoricalSalesForProduct(productId: Long): Int
+
+    @Query("SELECT * FROM products WHERE id = :productId LIMIT 1")
+    suspend fun getProductById(productId: Long): ProductEntity?
+
+    @Query("SELECT * FROM product_variants WHERE productId = :productId")
+    suspend fun getVariantsForProductSync(productId: Long): List<ProductVariantEntity>
 }

@@ -97,7 +97,10 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.R
+import com.example.ui.components.GoogleSignInButton
+import com.example.ui.components.attemptAutoSignIn
 import com.example.ui.security.AuthResult
+import com.example.ui.security.PinResult
 import com.example.ui.theme.DarkCharcoalText
 import com.example.ui.theme.DarkCharcoalTextSecondary
 import com.example.ui.theme.ForestGreenPrimary
@@ -123,10 +126,25 @@ fun LockScreen(
 ) {
     val focusManager = LocalFocusManager.current
     val coroutineScope = rememberCoroutineScope()
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val credentialManager = remember { androidx.credentials.CredentialManager.create(context) }
 
-    // Form inputs & states
-    var identifier by remember { mutableStateOf("ceylomirainfo@gmail.com") }
-    var password by remember { mutableStateOf("Ceyvana@2026") }
+    // Silent background auto-sign-in attempt on startup if Google session exists
+    LaunchedEffect(Unit) {
+        attemptAutoSignIn(
+            context = context,
+            credentialManager = credentialManager,
+            onAuthSuccess = { email, name ->
+                viewModel.onGoogleSignInSuccess(email, name)
+            },
+            onUnauthenticated = {},
+            scope = coroutineScope
+        )
+    }
+
+    // Form inputs & states (empty by default - never hardcode production credentials)
+    var identifier by remember { mutableStateOf("") }
+    var password by remember { mutableStateOf("") }
     var passwordVisible by remember { mutableStateOf(false) }
     var isAuthenticating by remember { mutableStateOf(false) }
 
@@ -219,13 +237,48 @@ fun LockScreen(
             if (newPin.length == 4) {
                 coroutineScope.launch {
                     delay(150)
-                    val success = viewModel.unlockApp(newPin)
-                    if (!success) {
-                        isPinError = true
-                        triggerShake()
-                        delay(600)
-                        enteredPin = ""
-                        isPinError = false
+                    if (!viewModel.hasConfiguredPin()) {
+                        val (ok, msg) = viewModel.setupPin(newPin)
+                        if (ok) {
+                            authErrorMessage = null
+                            viewModel.unlockWithPin(newPin)
+                            enteredPin = ""
+                        } else {
+                            isPinError = true
+                            authErrorMessage = msg
+                            triggerShake()
+                            delay(600)
+                            enteredPin = ""
+                            isPinError = false
+                        }
+                    } else {
+                        val result = viewModel.unlockWithPin(newPin)
+                        when (result) {
+                            is PinResult.Success -> {
+                                authErrorMessage = null
+                                enteredPin = ""
+                            }
+                            is PinResult.Error -> {
+                                isPinError = true
+                                authErrorMessage = "${result.message} (${result.attemptsRemaining} attempts remaining)"
+                                triggerShake()
+                                delay(600)
+                                enteredPin = ""
+                                isPinError = false
+                            }
+                            is PinResult.Lockout -> {
+                                isPinError = true
+                                authErrorMessage = "Security lockout: too many failed PIN attempts. Try again in ${result.secondsRemaining}s or sign in with Google."
+                                triggerShake()
+                                delay(600)
+                                enteredPin = ""
+                                isPinError = false
+                            }
+                            is PinResult.NotConfigured -> {
+                                authErrorMessage = "Security PIN has not been set yet."
+                                enteredPin = ""
+                            }
+                        }
                     }
                 }
             }
@@ -642,41 +695,47 @@ fun LockScreen(
                                     }
                                 }
 
-                                Spacer(modifier = Modifier.height(14.dp))
+                                Spacer(modifier = Modifier.height(12.dp))
 
-                                // Owner Credentials Quick Fill Helper & Mode Switch
                                 Row(
                                     modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    HorizontalDivider(modifier = Modifier.weight(1f), color = LockSoftGray.copy(alpha = 0.35f))
+                                    Text(
+                                        text = "   OR CLOUD SIGN-IN   ",
+                                        fontSize = 10.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        letterSpacing = 1.sp,
+                                        color = DarkCharcoalTextSecondary
+                                    )
+                                    HorizontalDivider(modifier = Modifier.weight(1f), color = LockSoftGray.copy(alpha = 0.35f))
+                                }
+
+                                Spacer(modifier = Modifier.height(12.dp))
+
+                                GoogleSignInButton(
+                                    onAuthSuccess = { email, name ->
+                                        viewModel.onGoogleSignInSuccess(email, name)
+                                    },
+                                    onAuthError = { err ->
+                                        authErrorMessage = err
+                                    }
+                                )
+
+                                Spacer(modifier = Modifier.height(14.dp))
+
+                                // Security Mode Switch
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.End,
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
                                     TextButton(
                                         onClick = {
-                                            identifier = "ceylomirainfo@gmail.com"
-                                            password = "Ceyvana@2026"
-                                            identifierError = null
-                                            passwordError = null
+                                            isPinMode = true
                                             authErrorMessage = null
                                         },
-                                        modifier = Modifier.testTag("fill_owner_credentials_button")
-                                    ) {
-                                        Icon(
-                                            imageVector = Icons.Default.Key,
-                                            contentDescription = null,
-                                            tint = LockMutedGold,
-                                            modifier = Modifier.size(15.dp)
-                                        )
-                                        Spacer(modifier = Modifier.width(5.dp))
-                                        Text(
-                                            text = "Fill Owner Credentials",
-                                            fontSize = 12.sp,
-                                            color = LockForestGreen,
-                                            fontWeight = FontWeight.SemiBold
-                                        )
-                                    }
-
-                                    TextButton(
-                                        onClick = { isPinMode = true },
                                         modifier = Modifier.testTag("switch_to_pin_mode_button")
                                     ) {
                                         Icon(
@@ -687,7 +746,7 @@ fun LockScreen(
                                         )
                                         Spacer(modifier = Modifier.width(4.dp))
                                         Text(
-                                            text = "Quick 4-Digit PIN",
+                                            text = if (viewModel.hasConfiguredPin()) "Use 4-Digit Security PIN" else "Setup 4-Digit Security PIN",
                                             fontSize = 12.sp,
                                             color = LockForestGreen,
                                             fontWeight = FontWeight.SemiBold
@@ -699,13 +758,20 @@ fun LockScreen(
                                 PinAuthenticationCard(
                                     enteredPin = enteredPin,
                                     isPinError = isPinError,
+                                    isConfigured = viewModel.hasConfiguredPin(),
+                                    authErrorMessage = authErrorMessage,
                                     onKeyPress = { handlePinKeyPress(it) },
                                     onBackspace = { handlePinBackspace() },
-                                    onQuickUnlock = { viewModel.quickUnlock() },
+                                    onClear = {
+                                        enteredPin = ""
+                                        isPinError = false
+                                        authErrorMessage = null
+                                    },
                                     onBackToPassword = {
                                         isPinMode = false
                                         enteredPin = ""
                                         isPinError = false
+                                        authErrorMessage = null
                                     }
                                 )
                             }
@@ -1010,40 +1076,46 @@ fun LockScreen(
                                 }
                             }
 
+                            Spacer(modifier = Modifier.height(10.dp))
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                HorizontalDivider(modifier = Modifier.weight(1f), color = LockSoftGray.copy(alpha = 0.35f))
+                                Text(
+                                    text = "   OR CLOUD SIGN-IN   ",
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    letterSpacing = 1.sp,
+                                    color = DarkCharcoalTextSecondary
+                                )
+                                HorizontalDivider(modifier = Modifier.weight(1f), color = LockSoftGray.copy(alpha = 0.35f))
+                            }
+
+                            Spacer(modifier = Modifier.height(10.dp))
+
+                            GoogleSignInButton(
+                                onAuthSuccess = { email, name ->
+                                    viewModel.onGoogleSignInSuccess(email, name)
+                                },
+                                onAuthError = { err ->
+                                    authErrorMessage = err
+                                }
+                            )
+
                             Spacer(modifier = Modifier.height(12.dp))
 
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
+                                horizontalArrangement = Arrangement.End,
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 TextButton(
                                     onClick = {
-                                        identifier = "ceylomirainfo@gmail.com"
-                                        password = "Ceyvana@2026"
-                                        identifierError = null
-                                        passwordError = null
+                                        isPinMode = true
                                         authErrorMessage = null
                                     },
-                                    modifier = Modifier.testTag("fill_owner_credentials_button")
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Default.Key,
-                                        contentDescription = null,
-                                        tint = LockMutedGold,
-                                        modifier = Modifier.size(14.dp)
-                                    )
-                                    Spacer(modifier = Modifier.width(4.dp))
-                                    Text(
-                                        text = "Fill Owner Login",
-                                        fontSize = 11.sp,
-                                        color = LockForestGreen,
-                                        fontWeight = FontWeight.Bold
-                                    )
-                                }
-
-                                TextButton(
-                                    onClick = { isPinMode = true },
                                     modifier = Modifier.testTag("switch_to_pin_mode_button")
                                 ) {
                                     Icon(
@@ -1054,7 +1126,7 @@ fun LockScreen(
                                     )
                                     Spacer(modifier = Modifier.width(4.dp))
                                     Text(
-                                        text = "Quick PIN",
+                                        text = if (viewModel.hasConfiguredPin()) "Use 4-Digit Security PIN" else "Setup 4-Digit Security PIN",
                                         fontSize = 11.sp,
                                         color = LockForestGreen,
                                         fontWeight = FontWeight.Bold
@@ -1066,13 +1138,20 @@ fun LockScreen(
                             PinAuthenticationCard(
                                 enteredPin = enteredPin,
                                 isPinError = isPinError,
+                                isConfigured = viewModel.hasConfiguredPin(),
+                                authErrorMessage = authErrorMessage,
                                 onKeyPress = { handlePinKeyPress(it) },
                                 onBackspace = { handlePinBackspace() },
-                                onQuickUnlock = { viewModel.quickUnlock() },
+                                onClear = {
+                                    enteredPin = ""
+                                    isPinError = false
+                                    authErrorMessage = null
+                                },
                                 onBackToPassword = {
                                     isPinMode = false
                                     enteredPin = ""
                                     isPinError = false
+                                    authErrorMessage = null
                                 }
                             )
                         }
@@ -1205,13 +1284,14 @@ fun LockScreen(
                     ) {
                         Column(modifier = Modifier.padding(10.dp)) {
                             Text(
-                                text = "Authorized Owner Profile:",
+                                text = "Security & Protection Standards:",
                                 fontSize = 12.sp,
                                 fontWeight = FontWeight.Bold,
                                 color = LockForestGreen
                             )
+                            Spacer(modifier = Modifier.height(4.dp))
                             Text(
-                                text = "Email: ceylomirainfo@gmail.com\nUsername: admin\nMaster Password: Ceyvana@2026\nDefault Terminal PIN: 1234",
+                                text = "• Primary Access: Firebase Authentication via Google Identity (OAuth 2.0)\n• Local Terminal Lock: Cryptographically salted SHA-256 hash\n• Plaintext Protection: No passwords or PINs stored in plaintext\n• Anti-Brute Force: 5 failed attempts trigger a progressive lockout",
                                 fontSize = 11.sp,
                                 color = DarkCharcoalTextSecondary,
                                 lineHeight = 16.sp
@@ -1239,9 +1319,11 @@ fun LockScreen(
 private fun PinAuthenticationCard(
     enteredPin: String,
     isPinError: Boolean,
+    isConfigured: Boolean,
+    authErrorMessage: String?,
     onKeyPress: (String) -> Unit,
     onBackspace: () -> Unit,
-    onQuickUnlock: () -> Unit,
+    onClear: () -> Unit,
     onBackToPassword: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -1255,7 +1337,7 @@ private fun PinAuthenticationCard(
             verticalAlignment = Alignment.CenterVertically
         ) {
             Text(
-                text = "Enter 4-Digit Owner PIN",
+                text = if (isConfigured) "Enter 4-Digit Security PIN" else "Setup 4-Digit Security PIN",
                 fontSize = 14.sp,
                 fontWeight = FontWeight.Bold,
                 color = LockForestGreen
@@ -1298,19 +1380,21 @@ private fun PinAuthenticationCard(
             }
         }
 
-        if (isPinError) {
+        if (authErrorMessage != null) {
             Spacer(modifier = Modifier.height(8.dp))
             Text(
-                text = "Incorrect PIN. Default is 1234",
-                color = Color(0xFFC53030),
+                text = authErrorMessage,
+                color = if (isPinError) Color(0xFFC53030) else LockForestGreen,
                 fontSize = 12.sp,
-                fontWeight = FontWeight.Medium
+                fontWeight = FontWeight.Medium,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.padding(horizontal = 16.dp)
             )
         }
 
         Spacer(modifier = Modifier.height(18.dp))
 
-        // NUMERIC KEYPAD (1-9, Quick Unlock, 0, Backspace)
+        // NUMERIC KEYPAD (1-9, Clear, 0, Backspace)
         val keys = listOf(
             listOf("1", "2", "3"),
             listOf("4", "5", "6"),
@@ -1331,27 +1415,27 @@ private fun PinAuthenticationCard(
             }
         }
 
-        // Bottom Row: Biometric/Quick Unlock, 0, Backspace
+        // Bottom Row: Clear, 0, Backspace
         Row(
             horizontalArrangement = Arrangement.spacedBy(14.dp),
             modifier = Modifier.padding(vertical = 4.dp)
         ) {
-            // Quick Biometric / Owner Bypass
+            // Clear Key
             Surface(
                 shape = CircleShape,
-                color = LockForestGreen.copy(alpha = 0.1f),
+                color = LockSoftGray.copy(alpha = 0.15f),
                 modifier = Modifier
                     .size(56.dp)
                     .clip(CircleShape)
-                    .clickable { onQuickUnlock() }
-                    .testTag("biometric_quick_unlock_button")
+                    .clickable { onClear() }
+                    .testTag("pin_clear_button")
             ) {
                 Box(contentAlignment = Alignment.Center) {
-                    Icon(
-                        imageVector = Icons.Default.Fingerprint,
-                        contentDescription = "Quick Biometric Unlock",
-                        tint = LockForestGreen,
-                        modifier = Modifier.size(26.dp)
+                    Text(
+                        text = "C",
+                        fontSize = 18.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = LockForestGreen
                     )
                 }
             }
@@ -1382,9 +1466,9 @@ private fun PinAuthenticationCard(
             }
         }
 
-        Spacer(modifier = Modifier.height(8.dp))
+        Spacer(modifier = Modifier.height(10.dp))
         Text(
-            text = "Terminal Default PIN: 1234",
+            text = if (isConfigured) "Salted cryptographic hash verification" else "Create a 4-digit code to lock your local terminal",
             fontSize = 11.sp,
             color = DarkCharcoalTextSecondary
         )

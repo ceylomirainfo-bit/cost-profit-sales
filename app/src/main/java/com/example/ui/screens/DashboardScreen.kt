@@ -208,6 +208,17 @@ fun DashboardScreen(
                         Spacer(modifier = Modifier.width(4.dp))
                         Text("Change Date", fontSize = 12.sp, color = ForestGreenPrimary, fontWeight = FontWeight.SemiBold)
                     }
+
+                    Spacer(modifier = Modifier.width(4.dp))
+
+                    OutlinedButton(
+                        onClick = { onNavigateToSection(MainNavigationSection.REPORTS) },
+                        shape = RoundedCornerShape(8.dp),
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                        modifier = Modifier.testTag("dashboard_open_reports_button")
+                    ) {
+                        Text("Reports", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = ForestGreenPrimary)
+                    }
                 }
             }
         }
